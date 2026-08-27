@@ -87,6 +87,26 @@ function updateAccountCredits(email, newCredits) {
   }
 }
 
+function normalizeAspectRatio(inputRatio, size) {
+  if (inputRatio) {
+    const r = String(inputRatio).trim();
+    if (['16:9', '9:16', '1:1', '4:3', '3:4', '3:2', '2:3', '21:9'].includes(r)) return r;
+    if (r.includes('16:9') || r === '16/9') return '16:9';
+    if (r.includes('9:16') || r === '9/16') return '9:16';
+    if (r.includes('1:1') || r === '1/1') return '1:1';
+    if (r.includes('4:3') || r === '4/3') return '4:3';
+    if (r.includes('3:4') || r === '3/4') return '3:4';
+  }
+  if (size) {
+    if (size === '1024x576' || size === '1920x1080' || size === '1280x720') return '16:9';
+    if (size === '576x1024' || size === '1080x1920' || size === '720x1280') return '9:16';
+    if (size === '1024x1024' || size === '512x512') return '1:1';
+    if (size === '1024x768') return '4:3';
+    if (size === '768x1024') return '3:4';
+  }
+  return '16:9';
+}
+
 // ----------------- Helper Functions -----------------
 async function downloadImageWithReferer(url) {
   return new Promise((resolve, reject) => {
@@ -384,6 +404,39 @@ async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
           } catch (e) {}
         };
         ws.on('message', onNetworkResponse);
+
+        // Set Aspect Ratio (16:9, 1:1, 9:16, etc.)
+        const targetRatio = normalizeAspectRatio(aspectRatio);
+        const setRatioScript = `
+          (() => {
+            const target = ${JSON.stringify(targetRatio)};
+            const spans = Array.from(document.querySelectorAll('span'));
+            const currentSpan = spans.find(s => ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'].includes((s.innerText || '').trim()));
+            const currentVal = currentSpan ? currentSpan.innerText.trim() : null;
+
+            if (currentVal === target) {
+              return { changed: false, ratio: currentVal };
+            }
+
+            if (currentSpan) {
+              const trigger = currentSpan.closest('[id*="popover-trigger"]') || currentSpan.parentElement;
+              if (trigger) trigger.click();
+            }
+
+            const labels = Array.from(document.querySelectorAll('label'));
+            const targetLabel = labels.find(l => (l.innerText || '').trim() === target);
+            if (targetLabel) {
+              targetLabel.click();
+              document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+              return { changed: true, ratio: target };
+            }
+
+            return { changed: false, error: 'Target label not found' };
+          })()
+        `;
+        const ratioRes = await sendCmd('Runtime.evaluate', { expression: setRatioScript, returnByValue: true });
+        console.log(`[PhotoGPT Generator] 📐 Aspect Ratio setup (${targetRatio}):`, ratioRes.result?.value);
+        await new Promise(r => setTimeout(r, 400));
 
         // Inject Prompt & Click Generate with Vue native prototype setter
         const escapedPrompt = JSON.stringify(prompt);
@@ -1010,7 +1063,8 @@ const DASHBOARD_HTML = `
           body: JSON.stringify({
             prompt,
             image: currentRefBase64,
-            size: ratio === '16:9' ? '1024x576' : '1024x1024'
+            aspect_ratio: ratio,
+            size: ratio === '16:9' ? '1024x576' : (ratio === '9:16' ? '576x1024' : '1024x1024')
           })
         }).then(r => r.json());
 
@@ -1178,17 +1232,19 @@ app.get('/api/v2/dreamina/query_result', (req, res) => {
 // POST /v1/images/generations (Standard OpenAI API)
 app.post('/v1/images/generations', async (req, res) => {
   console.log(`\n[OpenAI API /v1/images/generations] Request received at ${new Date().toLocaleTimeString()}`);
-  const { prompt, model, image, n = 1, size = '1024x1024', response_format = 'url' } = req.body;
+  const { prompt, model, image, n = 1, size = '1024x1024', response_format = 'url', aspect_ratio, ratio } = req.body;
   
   if (!prompt) {
     return res.status(400).json({ error: { message: 'Prompt is required', type: 'invalid_request_error' } });
   }
 
+  const finalRatio = normalizeAspectRatio(aspect_ratio || ratio, size);
+
   try {
     const rawImageUrl = await doPhotoGPTGenerate({
       prompt,
       refImage: image,
-      aspectRatio: '16:9'
+      aspectRatio: finalRatio
     });
 
     const proxyUrl = `http://127.0.0.1:${PORT}/proxy-image?url=${encodeURIComponent(rawImageUrl)}`;
