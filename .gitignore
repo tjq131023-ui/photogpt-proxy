@@ -1,0 +1,7 @@
+node_modules/
+photogpt_accounts.json
+uploads/
+*.log
+.env
+.DS_Store
+Thumbs.db

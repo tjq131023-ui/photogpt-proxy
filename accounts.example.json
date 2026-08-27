@@ -1,0 +1,11 @@
+[
+  {
+    "id": 1,
+    "email": "demo_account@gmail.com",
+    "name": "Demo Account",
+    "nc_token": "YOUR_NC_TOKEN_HERE",
+    "anonymous_user_id": "b0195994-8396-4257-93e1-75669505a1ea",
+    "available_credits": 20,
+    "active": true
+  }
+]

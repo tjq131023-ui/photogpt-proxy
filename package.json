@@ -1,0 +1,26 @@
+{
+  "name": "photogpt-proxy",
+  "version": "1.0.0",
+  "description": "PhotoGPT / GPT Image 2 Multi-Account Reverse Proxy Server with Visual Dashboard & OpenAI / Dreamina API Compatibility",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "photogpt",
+    "gpt-image-2",
+    "reverse-proxy",
+    "ai-image-generator",
+    "openai-compatible",
+    "dreamina-bridge",
+    "shuo-canvas"
+  ],
+  "author": "tjq131023-ui",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "puppeteer-core": "^24.3.0"
+  }
+}

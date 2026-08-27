@@ -1,0 +1,1135 @@
+const express = require('express');
+const cors = require('cors');
+const puppeteer = require('puppeteer-core');
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ extended: true, limit: '100mb' }));
+
+const PORT = process.env.PORT || 8180;
+const BROWSER_WS_URL = process.env.BROWSER_URL || 'http://127.0.0.1:9222';
+const ACCOUNTS_FILE = path.join(__dirname, 'photogpt_accounts.json');
+
+// Ensure uploads dir exists
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
+
+// ----------------- Stats & Logs Store -----------------
+const stats = {
+  totalGenerations: 0,
+  successfulGenerations: 0,
+  failedGenerations: 0,
+  startTime: Date.now()
+};
+
+const generationLogs = [];
+function addLog(logItem) {
+  generationLogs.unshift({
+    id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    time: new Date().toLocaleTimeString(),
+    ...logItem
+  });
+  if (generationLogs.length > 50) generationLogs.pop();
+}
+
+// ----------------- Account Pool Manager -----------------
+function loadAccounts() {
+  if (fs.existsSync(ACCOUNTS_FILE)) {
+    try {
+      return JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf-8'));
+    } catch (e) {
+      console.error('[AccountPool] Error parsing accounts file:', e);
+    }
+  }
+  return [];
+}
+
+function saveAccounts(accounts) {
+  fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2));
+}
+
+let accountIndex = 0;
+
+function getNextAvailableAccount() {
+  const accounts = loadAccounts();
+  if (accounts.length === 0) return null;
+
+  for (let i = 0; i < accounts.length; i++) {
+    const idx = (accountIndex + i) % accounts.length;
+    const acc = accounts[idx];
+    if (acc.active && (acc.available_credits === undefined || acc.available_credits >= 6)) {
+      accountIndex = (idx + 1) % accounts.length;
+      return acc;
+    }
+  }
+
+  return accounts.find(a => a.active) || accounts[0];
+}
+
+function updateAccountCredits(email, newCredits) {
+  const accounts = loadAccounts();
+  const acc = accounts.find(a => a.email === email);
+  if (acc) {
+    acc.available_credits = newCredits;
+    acc.used_times = (acc.used_times || 0) + 1;
+    saveAccounts(accounts);
+    console.log(`[AccountPool] Updated credits for ${email}: ${newCredits}`);
+  }
+}
+
+// ----------------- Helper Functions -----------------
+async function downloadImageWithReferer(url) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      headers: {
+        'Referer': 'https://photogpt.io/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
+      }
+    };
+    https.get(url, options, (res) => {
+      if (res.statusCode !== 200) {
+        return reject(new Error(`Failed to download image, status code: ${res.statusCode}`));
+      }
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    }).on('error', reject);
+  });
+}
+
+async function prepareRefImageFile(refImageInput) {
+  if (!refImageInput) return null;
+  
+  if (typeof refImageInput === 'string') {
+    if (refImageInput.startsWith('data:image/') || refImageInput.length > 500) {
+      let b64 = refImageInput;
+      let ext = 'png';
+      if (b64.includes(';base64,')) {
+        const parts = b64.split(';base64,');
+        if (parts[0].includes('jpeg') || parts[0].includes('jpg')) ext = 'jpg';
+        if (parts[0].includes('webp')) ext = 'webp';
+        b64 = parts[1];
+      }
+      const tmpPath = path.join(UPLOADS_DIR, `ref_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.${ext}`);
+      fs.writeFileSync(tmpPath, Buffer.from(b64, 'base64'));
+      console.log(`[PrepareRef] Saved Base64 ref image to ${tmpPath}`);
+      return tmpPath;
+    }
+    
+    if (fs.existsSync(refImageInput) && fs.statSync(refImageInput).isFile()) {
+      return refImageInput;
+    }
+
+    if (refImageInput.startsWith('http://') || refImageInput.startsWith('https://')) {
+      const ext = refImageInput.split('.').pop()?.split('?')[0] || 'png';
+      const tmpPath = path.join(UPLOADS_DIR, `ref_download_${Date.now()}.${ext}`);
+      const buffer = await new Promise((resolve, reject) => {
+        const getter = refImageInput.startsWith('https') ? https : require('http');
+        getter.get(refImageInput, res => {
+          const c = [];
+          res.on('data', d => c.push(d));
+          res.on('end', () => resolve(Buffer.concat(c)));
+        }).on('error', reject);
+      });
+      fs.writeFileSync(tmpPath, buffer);
+      return tmpPath;
+    }
+  }
+
+  return null;
+}
+
+// ----------------- Core PhotoGPT Runner -----------------
+async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
+  const startTime = Date.now();
+  stats.totalGenerations++;
+
+  const account = getNextAvailableAccount();
+  if (!account) {
+    stats.failedGenerations++;
+    const err = new Error('账号池中无可用账号（所有账号积分已耗尽或未激活），请在控制面板中添加新账号！');
+    addLog({ prompt, status: 'FAILED', error: err.message, account: 'None', duration: 0 });
+    throw err;
+  }
+
+  console.log(`\n[PhotoGPT Generator] Using Account: ${account.email} (Credits: ${account.available_credits})`);
+  console.log(`[PhotoGPT Generator] Prompt: "${prompt.slice(0, 100)}..."`);
+
+  const refFilePath = await prepareRefImageFile(refImage);
+  if (refFilePath) {
+    console.log(`[PhotoGPT Generator] Reference Image: ${refFilePath}`);
+  }
+
+  let browser;
+  try {
+    browser = await puppeteer.connect({ browserURL: BROWSER_WS_URL });
+  } catch (e) {
+    stats.failedGenerations++;
+    const err = new Error(`无法连接后台 Chrome (端口 9222): ${e.message}。请确保后台调试浏览器处于运行状态。`);
+    addLog({ prompt, status: 'FAILED', error: err.message, account: account.email, duration: 0 });
+    throw err;
+  }
+
+  const pages = await browser.pages();
+  let page = pages.find(p => p.url().includes('photogpt.io/ai-models/gpt-image-2') || p.url().includes('photogpt.io'));
+
+  if (!page) {
+    console.log('[PhotoGPT Generator] Opening new page for PhotoGPT...');
+    page = await browser.newPage();
+    await page.goto('https://photogpt.io/ai-models/gpt-image-2', { waitUntil: 'networkidle2' });
+  }
+
+  await page.bringToFront();
+
+  // Switch account cookies
+  if (account.nc_token) {
+    await page.setCookie(
+      { name: 'nc_token', value: account.nc_token, domain: '.photogpt.io', path: '/' },
+      { name: 'anonymous_user_id', value: account.anonymous_user_id || 'b0195994-8396-4257-93e1-75669505a1ea', domain: '.photogpt.io', path: '/' }
+    );
+  }
+
+  // Upload reference image if present
+  let uploadedUrl = null;
+  if (refFilePath) {
+    console.log('[PhotoGPT Generator] Uploading reference image via file input...');
+    const fileInputs = await page.$$('input[type="file"]');
+    for (const input of fileInputs) {
+      try {
+        await input.uploadFile(refFilePath);
+        console.log('[PhotoGPT Generator] File assigned to input!');
+        break;
+      } catch (e) {}
+    }
+
+    console.log('[PhotoGPT Generator] Waiting 3s for image upload completion...');
+    await new Promise(r => setTimeout(r, 3000));
+
+    uploadedUrl = await page.evaluate(() => {
+      const imgs = Array.from(document.querySelectorAll('img')).map(i => i.src);
+      return imgs.find(s => s.includes('prediction') || s.includes('asset') || s.includes('user_image') || s.includes('boost'));
+    });
+    console.log('[PhotoGPT Generator] Uploaded image preview in DOM:', uploadedUrl);
+  }
+
+  // Intercept the prediction request/response
+  const predictionPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('等待 PhotoGPT 提交接口响应超时 (30s)')), 30000);
+
+    const onResponse = async (res) => {
+      const url = res.url();
+      if (url.includes('/api/v1/prediction/handle')) {
+        try {
+          const json = await res.json();
+          console.log('[PhotoGPT Generator] Handle API Response:', JSON.stringify(json));
+          if (json.data && json.data.id) {
+            clearTimeout(timeout);
+            page.off('response', onResponse);
+            resolve(json.data.id);
+          }
+        } catch (e) {}
+      }
+    };
+
+    page.on('response', onResponse);
+  });
+
+  // Type prompt
+  console.log('[PhotoGPT Generator] Entering prompt...');
+  await page.evaluate((text) => {
+    const textarea = document.querySelector('textarea, div[contenteditable="true"]');
+    if (textarea) {
+      if (textarea.tagName === 'TEXTAREA') {
+        textarea.value = text;
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        textarea.dispatchEvent(new Event('change', { bubbles: true }));
+      } else {
+        textarea.innerText = text;
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }
+  }, prompt);
+
+  await new Promise(r => setTimeout(r, 1000));
+
+  // Click Submit / Generate button
+  console.log('[PhotoGPT Generator] Clicking generate button...');
+  const clicked = await page.evaluate(() => {
+    const allBtns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+    const btn = allBtns.find(b => {
+      const t = b.innerText ? b.innerText.trim() : '';
+      return t === 'Generate' || t === '立即生成' || t.includes('Generate') || (t.includes('Credit') && t.includes('6'));
+    });
+    if (btn) {
+      btn.click();
+      return { clicked: true, text: btn.innerText };
+    }
+    return { clicked: false };
+  });
+  console.log('[PhotoGPT Generator] Submit button click status:', clicked);
+
+  // Wait for Project ID from prediction/handle
+  console.log('[PhotoGPT Generator] Awaiting Project ID from network...');
+  let projectId = null;
+  try {
+    projectId = await predictionPromise;
+    console.log(`[PhotoGPT Generator] Got Project ID: ${projectId}`);
+  } catch (err) {
+    console.log('[PhotoGPT Generator] Retrying click via Native Enter key...');
+    const editor = await page.$('textarea, div[contenteditable="true"]');
+    if (editor) {
+      await editor.focus();
+      await page.keyboard.press('Enter');
+    }
+    projectId = await predictionPromise;
+  }
+
+  // Poll for completion
+  console.log(`[PhotoGPT Generator] Polling completion for Project ${projectId}...`);
+  let resultImageUrl = null;
+  const pollStart = Date.now();
+
+  for (let attempt = 1; attempt <= 45; attempt++) {
+    await new Promise(r => setTimeout(r, 2000));
+
+    const statusData = await page.evaluate(async (pid) => {
+      try {
+        const res = await fetch(`/api/v1/prediction/get-status?project_id=${pid}`);
+        return await res.json();
+      } catch (e) {
+        return { error: e.message };
+      }
+    }, projectId);
+
+    const taskStatus = statusData?.data?.status;
+    const progress = statusData?.data?.progress;
+    console.log(`[Poll #${attempt}] Status: ${taskStatus}, Progress: ${progress}% (Elapsed: ${Math.round((Date.now() - pollStart)/1000)}s)`);
+
+    if (taskStatus === 'COMPLETED' || taskStatus === 'SUCCESS' || (statusData?.data?.result_content && statusData?.data?.result_content.length > 0)) {
+      resultImageUrl = statusData.data.result_content?.[0] || statusData.data.output_urls?.[0] || statusData.data.result_url;
+      console.log(`\n🎉 [PhotoGPT Generator] SUCCESS! Generated image URL:\n${resultImageUrl}\n`);
+      break;
+    }
+
+    if (taskStatus === 'FAILED') {
+      const failMsg = statusData.data?.error || statusData.data?.reason || 'Task returned failed status';
+      stats.failedGenerations++;
+      addLog({ prompt, status: 'FAILED', error: failMsg, account: account.email, duration: Math.round((Date.now() - startTime)/1000) });
+      throw new Error(`PhotoGPT 生图失败: ${failMsg}`);
+    }
+  }
+
+  if (!resultImageUrl) {
+    stats.failedGenerations++;
+    const timeoutErr = new Error(`PhotoGPT 出图超时（已等待 90 秒）`);
+    addLog({ prompt, status: 'TIMEOUT', error: timeoutErr.message, account: account.email, duration: 90 });
+    throw timeoutErr;
+  }
+
+  const fullResolutionUrl = resultImageUrl.split('?')[0];
+  const durationSec = Math.round((Date.now() - startTime) / 1000);
+
+  // Update Account credits
+  if (account.available_credits !== undefined && account.available_credits >= 6) {
+    updateAccountCredits(account.email, account.available_credits - 6);
+  }
+
+  stats.successfulGenerations++;
+  addLog({
+    prompt,
+    status: 'SUCCESS',
+    account: account.email,
+    imageUrl: fullResolutionUrl,
+    duration: durationSec
+  });
+
+  return fullResolutionUrl;
+}
+
+// ----------------- Dreamina Tasks State Store -----------------
+const dreaminaTasks = new Map();
+
+// ----------------- Web Dashboard HTML -----------------
+const DASHBOARD_HTML = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PhotoGPT 多账号反代控制面板</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    body { font-family: 'Inter', sans-serif; background-color: #0b0f19; color: #f3f4f6; }
+    .glass-card { background: rgba(17, 24, 39, 0.85); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.08); }
+    .glow-btn { box-shadow: 0 0 20px rgba(99, 102, 241, 0.4); }
+    .glow-btn:hover { box-shadow: 0 0 30px rgba(99, 102, 241, 0.7); }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0b0f19; }
+    ::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+  <!-- Top Navigation -->
+  <header class="border-b border-gray-800/80 bg-gray-900/60 sticky top-0 z-50 backdrop-blur-md">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      <div class="flex items-center space-x-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 via-purple-500 to-pink-500 flex items-center justify-center shadow-lg shadow-indigo-500/20">
+          <i class="fa-solid fa-wand-magic-sparkles text-white text-lg"></i>
+        </div>
+        <div>
+          <h1 class="text-lg font-bold bg-gradient-to-r from-white via-gray-200 to-indigo-300 bg-clip-text text-transparent">PhotoGPT 反代服务控制台</h1>
+          <p class="text-xs text-gray-400">多账号自动轮询 · 无限生图 · 零审核拦截</p>
+        </div>
+      </div>
+      <div class="flex items-center space-x-3">
+        <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-2"></span> 服务运行中 (端口: 8180)
+        </span>
+        <button onclick="refreshData()" class="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm flex items-center space-x-1.5 transition">
+          <i class="fa-solid fa-rotate-right text-xs"></i> <span>刷新</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Content Area -->
+  <main class="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 w-full space-y-6">
+    
+    <!-- Top Stats Overview -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div class="glass-card rounded-2xl p-4 flex items-center justify-between">
+        <div>
+          <p class="text-xs text-gray-400 font-medium">账号总数 / 可用</p>
+          <h3 id="stat-accounts" class="text-2xl font-bold text-white mt-1">-- / --</h3>
+        </div>
+        <div class="w-12 h-12 rounded-xl bg-blue-500/10 text-blue-400 flex items-center justify-center text-xl">
+          <i class="fa-solid fa-users"></i>
+        </div>
+      </div>
+      <div class="glass-card rounded-2xl p-4 flex items-center justify-between">
+        <div>
+          <p class="text-xs text-gray-400 font-medium">可用总积分 (出图次数)</p>
+          <h3 id="stat-credits" class="text-2xl font-bold text-amber-400 mt-1">-- (约 -- 张)</h3>
+        </div>
+        <div class="w-12 h-12 rounded-xl bg-amber-500/10 text-amber-400 flex items-center justify-center text-xl">
+          <i class="fa-solid fa-coins"></i>
+        </div>
+      </div>
+      <div class="glass-card rounded-2xl p-4 flex items-center justify-between">
+        <div>
+          <p class="text-xs text-gray-400 font-medium">累计请求 / 成功出图</p>
+          <h3 id="stat-generations" class="text-2xl font-bold text-emerald-400 mt-1">-- / --</h3>
+        </div>
+        <div class="w-12 h-12 rounded-xl bg-emerald-500/10 text-emerald-400 flex items-center justify-center text-xl">
+          <i class="fa-solid fa-image"></i>
+        </div>
+      </div>
+      <div class="glass-card rounded-2xl p-4 flex items-center justify-between">
+        <div>
+          <p class="text-xs text-gray-400 font-medium">接口地址 (OpenAI 兼容)</p>
+          <p class="text-xs font-mono text-indigo-300 mt-1 truncate max-w-[160px]">/v1/images/generations</p>
+        </div>
+        <button onclick="copyEndpoint()" class="px-2.5 py-1.5 rounded-lg bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 text-xs flex items-center space-x-1 transition">
+          <i class="fa-regular fa-copy"></i> <span>复制</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Main Grid: Left Playground + Right Account Pool -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+      
+      <!-- Left Column: Test & Playground (5 cols) -->
+      <div class="lg:col-span-5 space-y-6">
+        <div class="glass-card rounded-2xl p-5 space-y-4">
+          <div class="flex items-center justify-between border-b border-gray-800 pb-3">
+            <div class="flex items-center space-x-2">
+              <i class="fa-solid fa-flask text-indigo-400"></i>
+              <h2 class="font-semibold text-white">在线生图测试 (Playground)</h2>
+            </div>
+            <span class="text-xs text-gray-400 font-mono">Model: GPT Image 2</span>
+          </div>
+
+          <!-- Prompt Input -->
+          <div>
+            <label class="block text-xs text-gray-300 font-medium mb-1.5">提示词 (Prompt)</label>
+            <textarea id="play-prompt" rows="3" class="w-full rounded-xl bg-gray-950/80 border border-gray-800 px-3.5 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition" placeholder="例如：全身角色立绘三视图，正视图，侧视图，后视图，灰色背景，写实风格..."></textarea>
+          </div>
+
+          <!-- Reference Image Dropzone -->
+          <div>
+            <label class="block text-xs text-gray-300 font-medium mb-1.5">参考图 / 垫图 (可选)</label>
+            <div id="drop-zone" class="border-2 border-dashed border-gray-800 hover:border-indigo-500/50 rounded-xl p-4 text-center cursor-pointer transition bg-gray-950/40 relative">
+              <input type="file" id="play-file" accept="image/*" class="hidden" onchange="handleFileSelect(event)">
+              <div id="drop-prompt" class="space-y-1">
+                <i class="fa-solid fa-cloud-arrow-up text-gray-400 text-2xl"></i>
+                <p class="text-xs text-gray-300">点击或拖拽图片至此处</p>
+                <p class="text-[10px] text-gray-500">支持 PNG / JPG / WebP</p>
+              </div>
+              <div id="drop-preview-box" class="hidden flex items-center justify-center relative">
+                <img id="drop-preview-img" class="max-h-32 rounded-lg object-contain border border-gray-800 shadow">
+                <button onclick="clearRefImage(event)" class="absolute top-1 right-1 w-6 h-6 rounded-full bg-rose-500/80 hover:bg-rose-600 text-white flex items-center justify-center text-xs transition">
+                  <i class="fa-solid fa-xmark"></i>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Aspect Ratio & Generate Button -->
+          <div class="flex items-center space-x-3 pt-2">
+            <select id="play-ratio" class="rounded-xl bg-gray-950/80 border border-gray-800 px-3 py-2.5 text-sm text-gray-200 focus:outline-none focus:border-indigo-500">
+              <option value="16:9">16:9 (横版)</option>
+              <option value="1:1">1:1 (正方形)</option>
+              <option value="9:16">9:16 (竖版)</option>
+              <option value="4:3">4:3</option>
+              <option value="3:4">3:4</option>
+            </select>
+            <button id="btn-generate" onclick="startGeneration()" class="flex-1 py-2.5 rounded-xl bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white font-medium text-sm flex items-center justify-center space-x-2 transition glow-btn">
+              <i class="fa-solid fa-bolt"></i> <span>立即生成 (消耗 6 积分)</span>
+            </button>
+          </div>
+
+          <!-- Result Area -->
+          <div id="play-result" class="hidden border-t border-gray-800 pt-4 space-y-3">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium text-emerald-400 flex items-center space-x-1.5">
+                <i class="fa-solid fa-circle-check"></i> <span id="res-duration">生成完成 (耗时 18s)</span>
+              </span>
+              <a id="res-download-btn" href="#" download="photogpt_result.png" class="text-xs text-indigo-400 hover:text-indigo-300 flex items-center space-x-1">
+                <i class="fa-solid fa-download"></i> <span>下载原图</span>
+              </a>
+            </div>
+            <div class="relative group rounded-xl overflow-hidden border border-gray-800 bg-black/40">
+              <img id="res-img" class="w-full object-contain max-h-72">
+            </div>
+          </div>
+        </div>
+
+        <!-- Connection Guides for SHUO Canvas -->
+        <div class="glass-card rounded-2xl p-5 space-y-3">
+          <div class="flex items-center space-x-2 text-white font-semibold">
+            <i class="fa-solid fa-circle-nodes text-indigo-400"></i>
+            <h3>SHUO Canvas 画布对接状态</h3>
+          </div>
+          <div class="text-xs text-gray-300 space-y-2 leading-relaxed">
+            <div class="flex items-center justify-between p-2.5 rounded-xl bg-gray-950/60 border border-gray-800">
+              <span class="text-gray-400">即梦/三视图自动代发：</span>
+              <span class="text-emerald-400 font-medium">已自动桥接 (127.0.0.1:8180)</span>
+            </div>
+            <div class="flex items-center justify-between p-2.5 rounded-xl bg-gray-950/60 border border-gray-800">
+              <span class="text-gray-400">OpenAI 标准 API：</span>
+              <span class="text-indigo-300 font-mono text-[11px]">http://127.0.0.1:8180/v1</span>
+            </div>
+            <p class="text-[11px] text-gray-500 pt-1">
+              ✨ 提示：在【替换工作室】点击【生成人物三视图】即可直接触发本服务出图，全程自动轮询账号，零审核拦截。
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Column: Account Pool Management (7 cols) -->
+      <div class="lg:col-span-7 space-y-6">
+        <div class="glass-card rounded-2xl p-5 space-y-4">
+          <div class="flex items-center justify-between border-b border-gray-800 pb-3">
+            <div class="flex items-center space-x-2">
+              <i class="fa-solid fa-users-gear text-indigo-400"></i>
+              <h2 class="font-semibold text-white">PhotoGPT 账号池管理</h2>
+            </div>
+            <button onclick="openAddAccountModal()" class="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium flex items-center space-x-1.5 transition">
+              <i class="fa-solid fa-plus"></i> <span>添加账号</span>
+            </button>
+          </div>
+
+          <!-- Accounts Table -->
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs">
+              <thead class="text-gray-400 border-b border-gray-800">
+                <tr>
+                  <th class="py-2.5 px-3">账号 / 邮箱</th>
+                  <th class="py-2.5 px-3">剩余积分</th>
+                  <th class="py-2.5 px-3">状态</th>
+                  <th class="py-2.5 px-3 text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody id="accounts-tbody" class="divide-y divide-gray-800/60 text-gray-200">
+                <!-- Dynamically populated -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Real-time Generation Logs -->
+        <div class="glass-card rounded-2xl p-5 space-y-3">
+          <div class="flex items-center justify-between border-b border-gray-800 pb-3">
+            <div class="flex items-center space-x-2">
+              <i class="fa-solid fa-clock-rotate-left text-indigo-400"></i>
+              <h2 class="font-semibold text-white">实时出图调用日志</h2>
+            </div>
+            <span class="text-xs text-gray-500" id="log-count">0 条记录</span>
+          </div>
+          <div id="logs-container" class="space-y-2 max-h-64 overflow-y-auto pr-1">
+            <!-- Dynamically populated logs -->
+            <p class="text-xs text-gray-500 text-center py-6">暂无调用记录，在左侧或画布中发起生图后将在此处实时显示。</p>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <!-- Add Account Modal -->
+  <div id="account-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="glass-card rounded-2xl max-w-md w-full p-6 space-y-4 border border-gray-700 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-gray-800 pb-3">
+        <h3 class="text-base font-semibold text-white flex items-center space-x-2">
+          <i class="fa-solid fa-user-plus text-indigo-400"></i> <span>添加 PhotoGPT 账号</span>
+        </h3>
+        <button onclick="closeAddAccountModal()" class="text-gray-400 hover:text-white transition">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+
+      <div class="space-y-3 text-xs">
+        <div>
+          <label class="block text-gray-300 font-medium mb-1">账号邮箱 (Email)</label>
+          <input type="email" id="modal-email" class="w-full rounded-xl bg-gray-950/80 border border-gray-800 px-3.5 py-2 text-gray-100 placeholder-gray-500 focus:outline-none focus:border-indigo-500" placeholder="例如：user@gmail.com">
+        </div>
+        <div>
+          <label class="block text-gray-300 font-medium mb-1">认证 Cookie: nc_token (必填)</label>
+          <textarea id="modal-token" rows="2" class="w-full rounded-xl bg-gray-950/80 border border-gray-800 px-3.5 py-2 font-mono text-[11px] text-gray-100 placeholder-gray-500 focus:outline-none focus:border-indigo-500" placeholder="复制 Cookie 中的 nc_token 字符串"></textarea>
+        </div>
+        <div>
+          <label class="block text-gray-300 font-medium mb-1">设备 Cookie: anonymous_user_id (可选)</label>
+          <input type="text" id="modal-anon" class="w-full rounded-xl bg-gray-950/80 border border-gray-800 px-3.5 py-2 font-mono text-[11px] text-gray-100 placeholder-gray-500 focus:outline-none focus:border-indigo-500" placeholder="例如：b0195994-8396-4257-93e1-...">
+        </div>
+        <div>
+          <label class="block text-gray-300 font-medium mb-1">初始免费积分 (默认 20)</label>
+          <input type="number" id="modal-credits" value="20" class="w-full rounded-xl bg-gray-950/80 border border-gray-800 px-3.5 py-2 text-gray-100 placeholder-gray-500 focus:outline-none focus:border-indigo-500">
+        </div>
+      </div>
+
+      <div class="flex items-center justify-end space-x-3 pt-2">
+        <button onclick="closeAddAccountModal()" class="px-4 py-2 rounded-xl bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs font-medium transition">取消</button>
+        <button onclick="submitNewAccount()" class="px-5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition glow-btn">保存账号</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentRefBase64 = null;
+
+    async function refreshData() {
+      try {
+        const [accRes, statsRes, logsRes] = await Promise.all([
+          fetch('/api/accounts').then(r => r.json()),
+          fetch('/api/stats').then(r => r.json()),
+          fetch('/api/logs').then(r => r.json())
+        ]);
+
+        renderAccounts(accRes.accounts || []);
+        renderStats(statsRes, accRes.accounts || []);
+        renderLogs(logsRes.logs || []);
+      } catch (e) {
+        console.error('Failed to refresh data:', e);
+      }
+    }
+
+    function renderStats(stats, accounts) {
+      const activeAccs = accounts.filter(a => a.active);
+      document.getElementById('stat-accounts').innerText = \`\${accounts.length} / \${activeAccs.length} 可用\`;
+      
+      const totalCredits = accounts.reduce((sum, a) => sum + (a.available_credits || 0), 0);
+      const estImages = Math.floor(totalCredits / 6);
+      document.getElementById('stat-credits').innerText = \`\${totalCredits} (约 \${estImages} 张)\`;
+
+      document.getElementById('stat-generations').innerText = \`\${stats.totalGenerations || 0} / \${stats.successfulGenerations || 0}\`;
+    }
+
+    function renderAccounts(accounts) {
+      const tbody = document.getElementById('accounts-tbody');
+      if (accounts.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" class="text-center py-6 text-gray-500">暂无账号，点击上方添加</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = accounts.map(a => {
+        const credits = a.available_credits !== undefined ? a.available_credits : 20;
+        const progress = Math.min(100, Math.round((credits / 20) * 100));
+        const color = credits >= 6 ? 'bg-indigo-500' : 'bg-rose-500';
+
+        return \`
+          <tr class="hover:bg-gray-800/40 transition">
+            <td class="py-3 px-3">
+              <div class="flex items-center space-x-2.5">
+                <div class="w-7 h-7 rounded-full bg-gray-800 flex items-center justify-center font-bold text-indigo-400 text-xs">
+                  \${(a.email || 'U')[0].toUpperCase()}
+                </div>
+                <div>
+                  <div class="font-medium text-gray-200">\${a.email}</div>
+                  <div class="text-[10px] text-gray-500 font-mono truncate max-w-[140px]">\${a.nc_token ? a.nc_token.slice(0, 10) + '...' : 'No token'}</div>
+                </div>
+              </div>
+            </td>
+            <td class="py-3 px-3">
+              <div class="w-32 space-y-1">
+                <div class="flex items-center justify-between text-[11px]">
+                  <span class="font-semibold text-gray-200">\${credits} 积分</span>
+                  <span class="text-gray-500">\${Math.floor(credits / 6)} 张</span>
+                </div>
+                <div class="w-full bg-gray-800 h-1.5 rounded-full overflow-hidden">
+                  <div class="\${color} h-full rounded-full transition-all duration-300" style="width: \${progress}%"></div>
+                </div>
+              </div>
+            </td>
+            <td class="py-3 px-3">
+              \${a.active && credits >= 6 ? 
+                '<span class="px-2 py-0.5 rounded text-[10px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">正常轮询</span>' : 
+                '<span class="px-2 py-0.5 rounded text-[10px] font-medium bg-rose-500/10 text-rose-400 border border-rose-500/20">积分不足</span>'}
+            </td>
+            <td class="py-3 px-3 text-right space-x-2">
+              <button onclick="toggleAccount(\${a.id})" class="text-gray-400 hover:text-indigo-400 transition" title="切换状态">
+                <i class="fa-solid \${a.active ? 'fa-toggle-on text-indigo-400 text-sm' : 'fa-toggle-off text-gray-600 text-sm'}"></i>
+              </button>
+              <button onclick="deleteAccount(\${a.id})" class="text-gray-400 hover:text-rose-400 transition" title="删除">
+                <i class="fa-regular fa-trash-can"></i>
+              </button>
+            </td>
+          </tr>
+        \`;
+      }).join('');
+    }
+
+    function renderLogs(logs) {
+      const container = document.getElementById('logs-container');
+      document.getElementById('log-count').innerText = \`\${logs.length} 条记录\`;
+
+      if (logs.length === 0) {
+        container.innerHTML = '<p class="text-xs text-gray-500 text-center py-6">暂无调用记录</p>';
+        return;
+      }
+
+      container.innerHTML = logs.map(l => {
+        const isSuccess = l.status === 'SUCCESS';
+        const badge = isSuccess ? 
+          '<span class="text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded text-[10px] font-medium">成功</span>' : 
+          '<span class="text-rose-400 bg-rose-500/10 px-2 py-0.5 rounded text-[10px] font-medium">失败</span>';
+
+        return \`
+          <div class="p-3 rounded-xl bg-gray-950/60 border border-gray-800 hover:border-gray-700 transition space-y-1.5">
+            <div class="flex items-center justify-between text-xs">
+              <div class="flex items-center space-x-2">
+                \${badge}
+                <span class="text-gray-400 font-mono text-[11px]">\${l.time}</span>
+                <span class="text-gray-400">账号: <strong class="text-gray-300">\${l.account}</strong></span>
+              </div>
+              <span class="text-gray-500 font-mono text-[11px]">\${l.duration}s</span>
+            </div>
+            <p class="text-xs text-gray-300 truncate" title="\${l.prompt}">\${l.prompt}</p>
+            \${l.error ? \`<p class="text-[11px] text-rose-400/90">\${l.error}</p>\` : ''}
+            \${l.imageUrl ? \`
+              <div class="pt-1 flex items-center space-x-2">
+                <img src="/proxy-image?url=\${encodeURIComponent(l.imageUrl)}" class="w-10 h-10 rounded object-cover border border-gray-800">
+                <a href="/proxy-image?url=\${encodeURIComponent(l.imageUrl)}" target="_blank" class="text-[11px] text-indigo-400 hover:underline">查看高清原图</a>
+              </div>
+            \` : ''}
+          </div>
+        \`;
+      }).join('');
+    }
+
+    // Modal controls
+    function openAddAccountModal() { document.getElementById('account-modal').classList.remove('hidden'); }
+    function closeAddAccountModal() { document.getElementById('account-modal').classList.add('hidden'); }
+
+    async function submitNewAccount() {
+      const email = document.getElementById('modal-email').value.trim();
+      const token = document.getElementById('modal-token').value.trim();
+      const anon = document.getElementById('modal-anon').value.trim();
+      const credits = parseInt(document.getElementById('modal-credits').value) || 20;
+
+      if (!email || !token) {
+        alert('请填写邮箱和 nc_token');
+        return;
+      }
+
+      const res = await fetch('/api/accounts/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, nc_token: token, anonymous_user_id: anon, available_credits: credits })
+      }).then(r => r.json());
+
+      closeAddAccountModal();
+      refreshData();
+    }
+
+    async function deleteAccount(id) {
+      if (!confirm('确定删除该账号吗？')) return;
+      await fetch('/api/accounts/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      });
+      refreshData();
+    }
+
+    async function toggleAccount(id) {
+      await fetch('/api/accounts/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      });
+      refreshData();
+    }
+
+    // File Drag & Drop
+    function handleFileSelect(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        currentRefBase64 = event.target.result;
+        document.getElementById('drop-prompt').classList.add('hidden');
+        document.getElementById('drop-preview-box').classList.remove('hidden');
+        document.getElementById('drop-preview-img').src = currentRefBase64;
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function clearRefImage(e) {
+      e.stopPropagation();
+      currentRefBase64 = null;
+      document.getElementById('play-file').value = '';
+      document.getElementById('drop-preview-box').classList.add('hidden');
+      document.getElementById('drop-prompt').classList.remove('hidden');
+    }
+
+    document.getElementById('drop-zone').addEventListener('click', () => {
+      document.getElementById('play-file').click();
+    });
+
+    // Generate Playground
+    async function startGeneration() {
+      const prompt = document.getElementById('play-prompt').value.trim();
+      const ratio = document.getElementById('play-ratio').value;
+      const btn = document.getElementById('btn-generate');
+
+      if (!prompt) {
+        alert('请输入提示词');
+        return;
+      }
+
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>正在全自动生图中 (约 15~25s)...</span>';
+
+      try {
+        const res = await fetch('/v1/images/generations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt,
+            image: currentRefBase64,
+            size: ratio === '16:9' ? '1024x576' : '1024x1024'
+          })
+        }).then(r => r.json());
+
+        if (res.error) {
+          throw new Error(res.error.message || 'Generation failed');
+        }
+
+        const imgUrl = res.data[0].url;
+        document.getElementById('res-img').src = imgUrl;
+        document.getElementById('res-download-btn').href = imgUrl;
+        document.getElementById('play-result').classList.remove('hidden');
+      } catch (e) {
+        alert('生图失败: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-bolt"></i> <span>立即生成 (消耗 6 积分)</span>';
+        refreshData();
+      }
+    }
+
+    function copyEndpoint() {
+      const url = window.location.origin + '/v1/images/generations';
+      navigator.clipboard.writeText(url);
+      alert('已复制 OpenAI 生图接口地址：' + url);
+    }
+
+    // Auto Refresh
+    refreshData();
+    setInterval(refreshData, 5000);
+  </script>
+</body>
+</html>
+`;
+
+// ----------------- Express Endpoints -----------------
+
+// GET / - Web Visual Dashboard
+app.get('/', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(DASHBOARD_HTML);
+});
+
+// GET /api/stats
+app.get('/api/stats', (req, res) => {
+  res.json({
+    ...stats,
+    uptimeSec: Math.round((Date.now() - stats.startTime) / 1000)
+  });
+});
+
+// GET /api/logs
+app.get('/api/logs', (req, res) => {
+  res.json({ logs: generationLogs });
+});
+
+// POST /api/v2/dreamina/image2image & text2image (Canvas Native Compatibility)
+const handleDreaminaGenerate = async (req, res) => {
+  const prompt = req.body.prompt || req.body.user_prompt || '';
+  const refImage = req.body.images?.[0] || req.body.image || req.body.inputUrls?.[0] || null;
+  const ratio = req.body.ratio || req.body.aspectRatio || '16:9';
+
+  console.log(`\n[Dreamina API Mock] Received Image Generation Request from Canvas`);
+  console.log(`[Dreamina API Mock] Prompt: "${prompt.slice(0, 80)}" | Has Ref: ${Boolean(refImage)}`);
+
+  const submitId = `pgpt_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  dreaminaTasks.set(submitId, { status: 'running', phase: 'generating', outputs: [], createdAt: Date.now() });
+
+  res.json({
+    success: true,
+    submitId: submitId,
+    data: { submitId: submitId }
+  });
+
+  (async () => {
+    try {
+      const rawImageUrl = await doPhotoGPTGenerate({ prompt, refImage, aspectRatio: ratio });
+      const proxyUrl = `http://127.0.0.1:${PORT}/proxy-image?url=${encodeURIComponent(rawImageUrl)}`;
+      
+      dreaminaTasks.set(submitId, {
+        status: 'success',
+        phase: 'done',
+        outputs: [
+          {
+            url: proxyUrl,
+            localUrl: proxyUrl,
+            imageUrl: proxyUrl,
+            sourceUrl: rawImageUrl
+          }
+        ],
+        finishedAt: Date.now()
+      });
+      console.log(`[Dreamina API Mock] Task ${submitId} completed successfully.`);
+    } catch (e) {
+      console.error(`[Dreamina API Mock] Task ${submitId} failed:`, e.message);
+      dreaminaTasks.set(submitId, {
+        status: 'failed',
+        phase: 'failed',
+        failReason: e.message,
+        outputs: [],
+        error: e.message
+      });
+    }
+  })();
+};
+
+app.post('/api/v2/dreamina/image2image', handleDreaminaGenerate);
+app.post('/api/v2/dreamina/text2image', handleDreaminaGenerate);
+app.post('/api/v2/dreamina/image_upscale', handleDreaminaGenerate);
+
+// GET /api/v2/dreamina/query_result
+app.get('/api/v2/dreamina/query_result', (req, res) => {
+  const submitId = req.query.submitId;
+  const task = dreaminaTasks.get(submitId);
+
+  if (!task) {
+    return res.json({
+      success: true,
+      status: 'pending',
+      data: { queueStatus: 'queued', queueIndex: 1 }
+    });
+  }
+
+  if (task.status === 'success') {
+    return res.json({
+      success: true,
+      status: 'success',
+      data: {
+        gen_status: 'success',
+        status: 'success',
+        image_infos: task.outputs,
+        images: task.outputs.map(o => o.url),
+        results: task.outputs
+      }
+    });
+  }
+
+  if (task.status === 'failed') {
+    return res.json({
+      success: false,
+      status: 'failed',
+      message: task.failReason || 'PhotoGPT Generation failed',
+      data: {
+        fail_reason: task.failReason,
+        status: 'failed'
+      }
+    });
+  }
+
+  return res.json({
+    success: true,
+    status: 'pending',
+    data: {
+      gen_status: 'generating',
+      status: 'pending'
+    }
+  });
+});
+
+// POST /v1/images/generations (Standard OpenAI API)
+app.post('/v1/images/generations', async (req, res) => {
+  console.log(`\n[OpenAI API /v1/images/generations] Request received at ${new Date().toLocaleTimeString()}`);
+  const { prompt, model, image, n = 1, size = '1024x1024', response_format = 'url' } = req.body;
+  
+  if (!prompt) {
+    return res.status(400).json({ error: { message: 'Prompt is required', type: 'invalid_request_error' } });
+  }
+
+  try {
+    const rawImageUrl = await doPhotoGPTGenerate({
+      prompt,
+      refImage: image,
+      aspectRatio: '16:9'
+    });
+
+    const proxyUrl = `http://127.0.0.1:${PORT}/proxy-image?url=${encodeURIComponent(rawImageUrl)}`;
+
+    if (response_format === 'b64_json') {
+      const imgBuffer = await downloadImageWithReferer(rawImageUrl);
+      const b64 = imgBuffer.toString('base64');
+      return res.json({
+        created: Math.floor(Date.now() / 1000),
+        data: [{ b64_json: b64, url: proxyUrl }]
+      });
+    }
+
+    return res.json({
+      created: Math.floor(Date.now() / 1000),
+      data: [{ url: proxyUrl, sourceUrl: rawImageUrl }]
+    });
+
+  } catch (err) {
+    console.error('[OpenAI API Error]', err);
+    return res.status(500).json({
+      error: {
+        message: `PhotoGPT 生图失败: ${err.message}`,
+        type: 'api_error'
+      }
+    });
+  }
+});
+
+// GET /v1/models
+app.get('/v1/models', (req, res) => {
+  res.json({
+    object: 'list',
+    data: [
+      { id: 'gpt-image-2', object: 'model', created: 1787813800, owned_by: 'photogpt' },
+      { id: 'gpt-image-2.0', object: 'model', created: 1787813800, owned_by: 'photogpt' }
+    ]
+  });
+});
+
+// GET /api/accounts - List all accounts & credits
+app.get('/api/accounts', (req, res) => {
+  const accounts = loadAccounts();
+  res.json({ count: accounts.length, accounts });
+});
+
+// POST /api/accounts/add - Add a new PhotoGPT account
+app.post('/api/accounts/add', (req, res) => {
+  const { email, name, nc_token, anonymous_user_id, available_credits = 20 } = req.body;
+  if (!email || !nc_token) {
+    return res.status(400).json({ error: 'email and nc_token are required' });
+  }
+
+  const accounts = loadAccounts();
+  const existingIdx = accounts.findIndex(a => a.email === email);
+  const newAccount = {
+    id: existingIdx >= 0 ? accounts[existingIdx].id : accounts.length + 1,
+    email,
+    name: name || email.split('@')[0],
+    nc_token,
+    anonymous_user_id: anonymous_user_id || '',
+    available_credits: Number(available_credits) || 20,
+    active: true
+  };
+
+  if (existingIdx >= 0) {
+    accounts[existingIdx] = newAccount;
+  } else {
+    accounts.push(newAccount);
+  }
+
+  saveAccounts(accounts);
+  res.json({ message: 'Account saved successfully', account: newAccount });
+});
+
+// POST /api/accounts/delete
+app.post('/api/accounts/delete', (req, res) => {
+  const { id } = req.body;
+  let accounts = loadAccounts();
+  accounts = accounts.filter(a => a.id !== id);
+  saveAccounts(accounts);
+  res.json({ success: true });
+});
+
+// POST /api/accounts/toggle
+app.post('/api/accounts/toggle', (req, res) => {
+  const { id } = req.body;
+  const accounts = loadAccounts();
+  const acc = accounts.find(a => a.id === id);
+  if (acc) {
+    acc.active = !acc.active;
+    saveAccounts(accounts);
+  }
+  res.json({ success: true, active: acc?.active });
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  const accounts = loadAccounts();
+  res.json({ status: 'ok', active_accounts: accounts.filter(a => a.active).length });
+});
+
+// Image Proxy to solve anti-hotlink Referer issue
+app.get('/proxy-image', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).send('Missing url');
+  try {
+    const buffer = await downloadImageWithReferer(url);
+    res.setHeader('Content-Type', 'image/png');
+    res.send(buffer);
+  } catch(e) {
+    res.status(500).send(e.message);
+  }
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`====================================================`);
+  console.log(` [PhotoGPT Multi-Account Reverse Proxy & Dashboard]`);
+  console.log(` Web Dashboard:  http://127.0.0.1:${PORT}`);
+  console.log(` OpenAI Endpoint: http://127.0.0.1:${PORT}/v1/images/generations`);
+  console.log(` Dreamina Mock:   http://127.0.0.1:${PORT}/api/v2/dreamina/*`);
+  console.log(` Account API:     http://127.0.0.1:${PORT}/api/accounts`);
+  console.log(`====================================================`);
+});
