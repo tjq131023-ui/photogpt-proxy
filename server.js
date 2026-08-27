@@ -1,9 +1,10 @@
 const express = require('express');
 const cors = require('cors');
-const puppeteer = require('puppeteer-core');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const http = require('http');
+const WebSocket = require('ws');
 
 const app = express();
 app.use(cors());
@@ -11,7 +12,7 @@ app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
 const PORT = process.env.PORT || 8180;
-const BROWSER_WS_URL = process.env.BROWSER_URL || 'http://127.0.0.1:9222';
+const CDP_HTTP = process.env.CDP_HTTP || 'http://127.0.0.1:9222';
 const ACCOUNTS_FILE = path.join(__dirname, 'photogpt_accounts.json');
 
 // Ensure uploads dir exists
@@ -55,6 +56,7 @@ function saveAccounts(accounts) {
 }
 
 let accountIndex = 0;
+let currentActiveToken = null;
 
 function getNextAvailableAccount() {
   const accounts = loadAccounts();
@@ -145,7 +147,32 @@ async function prepareRefImageFile(refImageInput) {
   return null;
 }
 
-// ----------------- Core PhotoGPT Runner -----------------
+// ----------------- Direct CDP WebSocket Helper -----------------
+async function getPhotoGPTTab() {
+  return new Promise((resolve, reject) => {
+    http.get(`${CDP_HTTP}/json/list`, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const tabs = JSON.parse(data);
+          let target = tabs.find(t => t.type === 'page' && t.url && t.url.includes('ai-models/gpt-image-2'));
+          if (!target) {
+            target = tabs.find(t => t.type === 'page' && t.url && t.url.includes('photogpt.io'));
+          }
+          if (!target) {
+            target = tabs.find(t => t.type === 'page');
+          }
+          resolve(target);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }).on('error', reject);
+  });
+}
+
+// ----------------- Core PhotoGPT Runner (Direct CDP Engine) -----------------
 async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
   const startTime = Date.now();
   stats.totalGenerations++;
@@ -158,198 +185,227 @@ async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
     throw err;
   }
 
-  console.log(`\n[PhotoGPT Generator] Using Account: ${account.email} (Credits: ${account.available_credits})`);
-  console.log(`[PhotoGPT Generator] Prompt: "${prompt.slice(0, 100)}..."`);
+  console.log(`\n[PhotoGPT Generator] ⚡ Using Account: ${account.email} (Credits: ${account.available_credits})`);
+  console.log(`[PhotoGPT Generator] 📝 Prompt: "${prompt.slice(0, 100)}..."`);
 
-  const refFilePath = await prepareRefImageFile(refImage);
-  if (refFilePath) {
-    console.log(`[PhotoGPT Generator] Reference Image: ${refFilePath}`);
-  }
-
-  let browser;
-  try {
-    browser = await puppeteer.connect({ browserURL: BROWSER_WS_URL });
-  } catch (e) {
+  const tab = await getPhotoGPTTab();
+  if (!tab || !tab.webSocketDebuggerUrl) {
     stats.failedGenerations++;
-    const err = new Error(`无法连接后台 Chrome (端口 9222): ${e.message}。请确保后台调试浏览器处于运行状态。`);
+    const err = new Error(`未检测到后台运行的 Chrome 标签页，请确保 Chrome 已启动（端口 9222）。`);
     addLog({ prompt, status: 'FAILED', error: err.message, account: account.email, duration: 0 });
     throw err;
   }
 
-  const pages = await browser.pages();
-  let page = pages.find(p => p.url().includes('photogpt.io/ai-models/gpt-image-2') || p.url().includes('photogpt.io'));
+  console.log(`[PhotoGPT Generator] 🔗 Connecting to CDP WebSocket: ${tab.title}`);
 
-  if (!page) {
-    console.log('[PhotoGPT Generator] Opening new page for PhotoGPT...');
-    page = await browser.newPage();
-    await page.goto('https://photogpt.io/ai-models/gpt-image-2', { waitUntil: 'networkidle2' });
-  }
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(tab.webSocketDebuggerUrl);
+    let msgId = 1;
+    let isFinished = false;
 
-  await page.bringToFront();
-
-  // Switch account cookies
-  if (account.nc_token) {
-    await page.setCookie(
-      { name: 'nc_token', value: account.nc_token, domain: '.photogpt.io', path: '/' },
-      { name: 'anonymous_user_id', value: account.anonymous_user_id || 'b0195994-8396-4257-93e1-75669505a1ea', domain: '.photogpt.io', path: '/' }
-    );
-  }
-
-  // Upload reference image if present
-  let uploadedUrl = null;
-  if (refFilePath) {
-    console.log('[PhotoGPT Generator] Uploading reference image via file input...');
-    const fileInputs = await page.$$('input[type="file"]');
-    for (const input of fileInputs) {
-      try {
-        await input.uploadFile(refFilePath);
-        console.log('[PhotoGPT Generator] File assigned to input!');
-        break;
-      } catch (e) {}
-    }
-
-    console.log('[PhotoGPT Generator] Waiting 3s for image upload completion...');
-    await new Promise(r => setTimeout(r, 3000));
-
-    uploadedUrl = await page.evaluate(() => {
-      const imgs = Array.from(document.querySelectorAll('img')).map(i => i.src);
-      return imgs.find(s => s.includes('prediction') || s.includes('asset') || s.includes('user_image') || s.includes('boost'));
-    });
-    console.log('[PhotoGPT Generator] Uploaded image preview in DOM:', uploadedUrl);
-  }
-
-  // Intercept the prediction request/response
-  const predictionPromise = new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('等待 PhotoGPT 提交接口响应超时 (30s)')), 30000);
-
-    const onResponse = async (res) => {
-      const url = res.url();
-      if (url.includes('/api/v1/prediction/handle')) {
-        try {
-          const json = await res.json();
-          console.log('[PhotoGPT Generator] Handle API Response:', JSON.stringify(json));
-          if (json.data && json.data.id) {
-            clearTimeout(timeout);
-            page.off('response', onResponse);
-            resolve(json.data.id);
-          }
-        } catch (e) {}
-      }
+    const cleanup = () => {
+      isFinished = true;
+      try { ws.close(); } catch (e) {}
     };
 
-    page.on('response', onResponse);
-  });
+    const sendCmd = (method, params = {}) => {
+      return new Promise((resCmd, rejCmd) => {
+        const id = msgId++;
+        const payload = JSON.stringify({ id, method, params });
+        
+        const handler = (raw) => {
+          try {
+            const resp = JSON.parse(raw);
+            if (resp.id === id) {
+              ws.off('message', handler);
+              if (resp.error) rejCmd(new Error(resp.error.message || 'CDP Error'));
+              else resCmd(resp.result || {});
+            }
+          } catch (e) {}
+        };
+        
+        ws.on('message', handler);
+        ws.send(payload, (err) => { if (err) rejCmd(err); });
+      });
+    };
 
-  // Type prompt
-  console.log('[PhotoGPT Generator] Entering prompt...');
-  await page.evaluate((text) => {
-    const textarea = document.querySelector('textarea, div[contenteditable="true"]');
-    if (textarea) {
-      if (textarea.tagName === 'TEXTAREA') {
-        textarea.value = text;
-        textarea.dispatchEvent(new Event('input', { bubbles: true }));
-        textarea.dispatchEvent(new Event('change', { bubbles: true }));
-      } else {
-        textarea.innerText = text;
-        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    ws.on('error', (err) => {
+      if (!isFinished) {
+        cleanup();
+        stats.failedGenerations++;
+        addLog({ prompt, status: 'FAILED', error: err.message, account: account.email, duration: 0 });
+        reject(err);
       }
-    }
-  }, prompt);
-
-  await new Promise(r => setTimeout(r, 1000));
-
-  // Click Submit / Generate button
-  console.log('[PhotoGPT Generator] Clicking generate button...');
-  const clicked = await page.evaluate(() => {
-    const allBtns = Array.from(document.querySelectorAll('button, div[role="button"]'));
-    const btn = allBtns.find(b => {
-      const t = b.innerText ? b.innerText.trim() : '';
-      return t === 'Generate' || t === '立即生成' || t.includes('Generate') || (t.includes('Credit') && t.includes('6'));
     });
-    if (btn) {
-      btn.click();
-      return { clicked: true, text: btn.innerText };
-    }
-    return { clicked: false };
-  });
-  console.log('[PhotoGPT Generator] Submit button click status:', clicked);
 
-  // Wait for Project ID from prediction/handle
-  console.log('[PhotoGPT Generator] Awaiting Project ID from network...');
-  let projectId = null;
-  try {
-    projectId = await predictionPromise;
-    console.log(`[PhotoGPT Generator] Got Project ID: ${projectId}`);
-  } catch (err) {
-    console.log('[PhotoGPT Generator] Retrying click via Native Enter key...');
-    const editor = await page.$('textarea, div[contenteditable="true"]');
-    if (editor) {
-      await editor.focus();
-      await page.keyboard.press('Enter');
-    }
-    projectId = await predictionPromise;
-  }
-
-  // Poll for completion
-  console.log(`[PhotoGPT Generator] Polling completion for Project ${projectId}...`);
-  let resultImageUrl = null;
-  const pollStart = Date.now();
-
-  for (let attempt = 1; attempt <= 45; attempt++) {
-    await new Promise(r => setTimeout(r, 2000));
-
-    const statusData = await page.evaluate(async (pid) => {
+    ws.on('open', async () => {
       try {
-        const res = await fetch(`/api/v1/prediction/get-status?project_id=${pid}`);
-        return await res.json();
-      } catch (e) {
-        return { error: e.message };
+        await sendCmd('Network.enable');
+
+        // Check if token changed -> reload page with new cookie
+        const needSwitch = account.nc_token && account.nc_token !== currentActiveToken;
+        if (needSwitch) {
+          console.log(`[PhotoGPT Generator] 🔄 Switching session to ${account.email}...`);
+          await sendCmd('Network.setCookie', {
+            name: 'nc_token',
+            value: account.nc_token,
+            domain: '.photogpt.io',
+            path: '/'
+          });
+          if (account.anonymous_user_id) {
+            await sendCmd('Network.setCookie', {
+              name: 'anonymous_user_id',
+              value: account.anonymous_user_id,
+              domain: '.photogpt.io',
+              path: '/'
+            });
+          }
+          currentActiveToken = account.nc_token;
+          await sendCmd('Page.navigate', { url: 'https://photogpt.io/ai-models/gpt-image-2' });
+          await new Promise(r => setTimeout(r, 2500));
+        } else if (!tab.url.includes('/ai-models/gpt-image-2')) {
+          console.log('[PhotoGPT Generator] Navigating to https://photogpt.io/ai-models/gpt-image-2...');
+          await sendCmd('Page.navigate', { url: 'https://photogpt.io/ai-models/gpt-image-2' });
+          await new Promise(r => setTimeout(r, 2000));
+        }
+
+        // Listen for prediction/handle API response
+        let projectId = null;
+        let predictionError = null;
+        const onNetworkResponse = async (raw) => {
+          try {
+            const ev = JSON.parse(raw);
+            if (ev.method === 'Network.responseReceived') {
+              const respUrl = ev.params?.response?.url || '';
+              if (respUrl.includes('/api/v1/prediction/handle')) {
+                const reqId = ev.params.requestId;
+                const bodyRes = await sendCmd('Network.getResponseBody', { requestId: reqId });
+                const bodyData = JSON.parse(bodyRes.body || '{}');
+                console.log('[PhotoGPT Generator] 📥 Prediction Response Body:', JSON.stringify(bodyData));
+                
+                if (bodyData.code === 100024 || (bodyData.message && bodyData.message.includes('credits left'))) {
+                  predictionError = bodyData.message || 'Only 2 credits left';
+                  updateAccountCredits(account.email, 2);
+                } else if (bodyData.code !== 100000 && bodyData.code !== undefined && bodyData.code !== 0) {
+                  predictionError = bodyData.message || 'API returned error code ' + bodyData.code;
+                } else {
+                  projectId = bodyData.data?.project_id || bodyData.data?.id;
+                }
+              }
+            }
+          } catch (e) {}
+        };
+        ws.on('message', onNetworkResponse);
+
+        // Inject Prompt & Click Generate with Vue native prototype setter
+        const escapedPrompt = JSON.stringify(prompt);
+        const evalScript = `
+          (() => {
+            const ta = document.querySelector('textarea');
+            if (!ta) return { success: false, error: 'No textarea found on page' };
+
+            ta.focus();
+            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+            nativeSetter.call(ta, ${escapedPrompt});
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            ta.dispatchEvent(new Event('change', { bubbles: true }));
+
+            const btns = Array.from(document.querySelectorAll('button'));
+            const genBtn = btns.find(b => {
+              const t = (b.innerText || '').trim();
+              return t === 'Generate' || t === '立即生成' || t.includes('Generate') || (t.includes('Credit') && t.includes('6'));
+            });
+
+            if (genBtn) {
+              genBtn.click();
+              return { success: true, text: genBtn.innerText, disabled: genBtn.disabled };
+            }
+            return { success: false, error: 'No generate button found' };
+          })()
+        `;
+
+        console.log('[PhotoGPT Generator] 🖱️ Injecting prompt and clicking Generate...');
+        const clickRes = await sendCmd('Runtime.evaluate', { expression: evalScript, returnByValue: true });
+        console.log('[PhotoGPT Generator] Click Result:', clickRes.result?.value);
+
+        // Wait up to 15s for Project ID or Error
+        const waitStart = Date.now();
+        while (!projectId && !predictionError && Date.now() - waitStart < 15000) {
+          await new Promise(r => setTimeout(r, 500));
+        }
+
+        ws.off('message', onNetworkResponse);
+
+        if (predictionError) {
+          cleanup();
+          console.warn(`[PhotoGPT Generator] ⚠️ Account ${account.email} failed with: "${predictionError}". Trying next account...`);
+          return resolve(await doPhotoGPTGenerate({ prompt, refImage, aspectRatio }));
+        }
+
+        if (!projectId) {
+          throw new Error('未能在 15 秒内捕获到 PhotoGPT 提交任务 ID (project_id)');
+        }
+
+        console.log(`[PhotoGPT Generator] 🎉 Captured Project ID: ${projectId}! Polling status...`);
+
+        // Poll status via Runtime.evaluate
+        let resultImageUrl = null;
+        for (let attempt = 1; attempt <= 45; attempt++) {
+          await new Promise(r => setTimeout(r, 2000));
+
+          const pollExpr = `fetch('/api/v1/prediction/get-status?project_id=${projectId}').then(r => r.json())`;
+          const pollRes = await sendCmd('Runtime.evaluate', { expression: pollExpr, awaitPromise: true, returnByValue: true });
+          const val = pollRes.result?.value;
+          const taskStatus = val?.data?.status;
+          const progress = val?.data?.progress;
+          const firstResult = val?.data?.results?.[0];
+          const imgUrl = firstResult?.result_content || val?.data?.result_content?.[0] || val?.data?.output_urls?.[0] || val?.data?.result_url;
+          const isCompleted = taskStatus === 1 || taskStatus === '1' || taskStatus === 'COMPLETED' || taskStatus === 'SUCCESS';
+
+          console.log(`[Poll #${attempt}] Status: ${taskStatus}, Progress: ${progress}% (Elapsed: ${Math.round((Date.now() - startTime)/1000)}s)`);
+
+          if ((isCompleted && imgUrl) || imgUrl) {
+            resultImageUrl = imgUrl;
+            console.log(`\n🎉 [PhotoGPT Generator] SUCCESS! Generated image URL:\n${resultImageUrl}\n`);
+            break;
+          }
+
+          if (taskStatus === 2 || taskStatus === '2' || taskStatus === 'FAILED' || firstResult?.error) {
+            throw new Error(`PhotoGPT 任务返回失败: ${firstResult?.error || val?.data?.error || val?.data?.reason || 'Task failed'}`);
+          }
+        }
+
+        if (!resultImageUrl) {
+          throw new Error(`PhotoGPT 出图超时（已等待 90 秒）`);
+        }
+
+        const fullResolutionUrl = resultImageUrl.split('?')[0];
+        const durationSec = Math.round((Date.now() - startTime) / 1000);
+
+        if (account.available_credits !== undefined && account.available_credits >= 6) {
+          updateAccountCredits(account.email, account.available_credits - 6);
+        }
+
+        stats.successfulGenerations++;
+        addLog({
+          prompt,
+          status: 'SUCCESS',
+          account: account.email,
+          imageUrl: fullResolutionUrl,
+          duration: durationSec
+        });
+
+        cleanup();
+        resolve(fullResolutionUrl);
+
+      } catch (err) {
+        cleanup();
+        stats.failedGenerations++;
+        addLog({ prompt, status: 'FAILED', error: err.message, account: account.email, duration: Math.round((Date.now() - startTime)/1000) });
+        reject(err);
       }
-    }, projectId);
-
-    const taskStatus = statusData?.data?.status;
-    const progress = statusData?.data?.progress;
-    console.log(`[Poll #${attempt}] Status: ${taskStatus}, Progress: ${progress}% (Elapsed: ${Math.round((Date.now() - pollStart)/1000)}s)`);
-
-    if (taskStatus === 'COMPLETED' || taskStatus === 'SUCCESS' || (statusData?.data?.result_content && statusData?.data?.result_content.length > 0)) {
-      resultImageUrl = statusData.data.result_content?.[0] || statusData.data.output_urls?.[0] || statusData.data.result_url;
-      console.log(`\n🎉 [PhotoGPT Generator] SUCCESS! Generated image URL:\n${resultImageUrl}\n`);
-      break;
-    }
-
-    if (taskStatus === 'FAILED') {
-      const failMsg = statusData.data?.error || statusData.data?.reason || 'Task returned failed status';
-      stats.failedGenerations++;
-      addLog({ prompt, status: 'FAILED', error: failMsg, account: account.email, duration: Math.round((Date.now() - startTime)/1000) });
-      throw new Error(`PhotoGPT 生图失败: ${failMsg}`);
-    }
-  }
-
-  if (!resultImageUrl) {
-    stats.failedGenerations++;
-    const timeoutErr = new Error(`PhotoGPT 出图超时（已等待 90 秒）`);
-    addLog({ prompt, status: 'TIMEOUT', error: timeoutErr.message, account: account.email, duration: 90 });
-    throw timeoutErr;
-  }
-
-  const fullResolutionUrl = resultImageUrl.split('?')[0];
-  const durationSec = Math.round((Date.now() - startTime) / 1000);
-
-  // Update Account credits
-  if (account.available_credits !== undefined && account.available_credits >= 6) {
-    updateAccountCredits(account.email, account.available_credits - 6);
-  }
-
-  stats.successfulGenerations++;
-  addLog({
-    prompt,
-    status: 'SUCCESS',
-    account: account.email,
-    imageUrl: fullResolutionUrl,
-    duration: durationSec
+    });
   });
-
-  return fullResolutionUrl;
 }
 
 // ----------------- Dreamina Tasks State Store -----------------
@@ -461,7 +517,7 @@ const DASHBOARD_HTML = `
           <!-- Prompt Input -->
           <div>
             <label class="block text-xs text-gray-300 font-medium mb-1.5">提示词 (Prompt)</label>
-            <textarea id="play-prompt" rows="3" class="w-full rounded-xl bg-gray-950/80 border border-gray-800 px-3.5 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition" placeholder="例如：全身角色立绘三视图，正视图，侧视图，后视图，灰色背景，写实风格..."></textarea>
+            <textarea id="play-prompt" rows="3" class="w-full rounded-xl bg-gray-950/80 border border-gray-800 px-3.5 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition" placeholder="例如：可爱金毛小狗幼犬，写实摄影高清，柔和光影，4K..."></textarea>
           </div>
 
           <!-- Reference Image Dropzone -->
