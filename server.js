@@ -57,21 +57,23 @@ function saveAccounts(accounts) {
 
 let accountIndex = 0;
 let currentActiveToken = null;
+let isSyncingCredits = false;
 
+// Strictly select only accounts with active === true AND available_credits >= 6
 function getNextAvailableAccount() {
   const accounts = loadAccounts();
   if (accounts.length === 0) return null;
 
-  for (let i = 0; i < accounts.length; i++) {
-    const idx = (accountIndex + i) % accounts.length;
-    const acc = accounts[idx];
-    if (acc.active && (acc.available_credits === undefined || acc.available_credits >= 6)) {
-      accountIndex = (idx + 1) % accounts.length;
-      return acc;
-    }
+  // Filter accounts strictly having >= 6 credits
+  const eligible = accounts.filter(a => a.active && (a.available_credits === undefined || a.available_credits >= 6));
+  if (eligible.length === 0) {
+    console.warn('[AccountPool] ❌ 所有账号积分均已不足 6 积分，自动停止轮询！');
+    return null;
   }
 
-  return accounts.find(a => a.active) || accounts[0];
+  const idx = accountIndex % eligible.length;
+  accountIndex = (idx + 1) % eligible.length;
+  return eligible[idx];
 }
 
 function updateAccountCredits(email, newCredits) {
@@ -79,9 +81,9 @@ function updateAccountCredits(email, newCredits) {
   const acc = accounts.find(a => a.email === email);
   if (acc) {
     acc.available_credits = newCredits;
-    acc.used_times = (acc.used_times || 0) + 1;
+    acc.last_synced = new Date().toLocaleTimeString();
     saveAccounts(accounts);
-    console.log(`[AccountPool] Updated credits for ${email}: ${newCredits}`);
+    console.log(`[AccountPool] 💰 Updated credits for ${email}: ${newCredits}`);
   }
 }
 
@@ -103,48 +105,6 @@ async function downloadImageWithReferer(url) {
       res.on('end', () => resolve(Buffer.concat(chunks)));
     }).on('error', reject);
   });
-}
-
-async function prepareRefImageFile(refImageInput) {
-  if (!refImageInput) return null;
-  
-  if (typeof refImageInput === 'string') {
-    if (refImageInput.startsWith('data:image/') || refImageInput.length > 500) {
-      let b64 = refImageInput;
-      let ext = 'png';
-      if (b64.includes(';base64,')) {
-        const parts = b64.split(';base64,');
-        if (parts[0].includes('jpeg') || parts[0].includes('jpg')) ext = 'jpg';
-        if (parts[0].includes('webp')) ext = 'webp';
-        b64 = parts[1];
-      }
-      const tmpPath = path.join(UPLOADS_DIR, `ref_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.${ext}`);
-      fs.writeFileSync(tmpPath, Buffer.from(b64, 'base64'));
-      console.log(`[PrepareRef] Saved Base64 ref image to ${tmpPath}`);
-      return tmpPath;
-    }
-    
-    if (fs.existsSync(refImageInput) && fs.statSync(refImageInput).isFile()) {
-      return refImageInput;
-    }
-
-    if (refImageInput.startsWith('http://') || refImageInput.startsWith('https://')) {
-      const ext = refImageInput.split('.').pop()?.split('?')[0] || 'png';
-      const tmpPath = path.join(UPLOADS_DIR, `ref_download_${Date.now()}.${ext}`);
-      const buffer = await new Promise((resolve, reject) => {
-        const getter = refImageInput.startsWith('https') ? https : require('http');
-        getter.get(refImageInput, res => {
-          const c = [];
-          res.on('data', d => c.push(d));
-          res.on('end', () => resolve(Buffer.concat(c)));
-        }).on('error', reject);
-      });
-      fs.writeFileSync(tmpPath, buffer);
-      return tmpPath;
-    }
-  }
-
-  return null;
 }
 
 // ----------------- Direct CDP WebSocket Helper -----------------
@@ -172,6 +132,120 @@ async function getPhotoGPTTab() {
   });
 }
 
+// Script to read live credit from PhotoGPT DOM
+const EXTRACT_CREDIT_SCRIPT = `
+  (() => {
+    const spans = Array.from(document.querySelectorAll('span'));
+    const creditSpan = spans.find(s => s.innerText.trim() === 'Credit');
+    if (creditSpan) {
+      const row = creditSpan.closest('.w-full') || creditSpan.parentElement?.parentElement;
+      if (row) {
+        const num = row.innerText.replace(/[^0-9]/g, '');
+        if (num) return parseInt(num);
+      }
+    }
+    return null;
+  })()
+`;
+
+// Sync real credits for all accounts in pool
+async function syncAllAccountsRealCredits() {
+  if (isSyncingCredits) return { success: false, message: 'Sync already in progress' };
+  isSyncingCredits = true;
+  console.log('\n[AccountPool] 🔄 Starting full sync of real live credits from PhotoGPT...');
+
+  try {
+    const tab = await getPhotoGPTTab();
+    if (!tab || !tab.webSocketDebuggerUrl) {
+      isSyncingCredits = false;
+      return { success: false, message: 'No Chrome tab available' };
+    }
+
+    const accounts = loadAccounts();
+    const ws = new WebSocket(tab.webSocketDebuggerUrl);
+
+    await new Promise((resolve, reject) => {
+      let msgId = 1;
+      const sendCmd = (method, params = {}) => {
+        return new Promise((resCmd, rejCmd) => {
+          const id = msgId++;
+          const payload = JSON.stringify({ id, method, params });
+          const handler = (raw) => {
+            try {
+              const resp = JSON.parse(raw);
+              if (resp.id === id) {
+                ws.off('message', handler);
+                if (resp.error) rejCmd(new Error(resp.error.message || 'CDP Error'));
+                else resCmd(resp.result || {});
+              }
+            } catch (e) {}
+          };
+          ws.on('message', handler);
+          ws.send(payload, (err) => { if (err) rejCmd(err); });
+        });
+      };
+
+      ws.on('open', async () => {
+        try {
+          await sendCmd('Network.enable');
+
+          for (const acc of accounts) {
+            if (!acc.nc_token) continue;
+            console.log(`[AccountPool] Checking real balance for: ${acc.email}...`);
+            await sendCmd('Network.setCookie', {
+              name: 'nc_token',
+              value: acc.nc_token,
+              domain: '.photogpt.io',
+              path: '/'
+            });
+            await sendCmd('Page.navigate', { url: 'https://photogpt.io/ai-models/gpt-image-2' });
+            
+            // Poll for credit element
+            let liveCredits = null;
+            for (let i = 0; i < 8; i++) {
+              await new Promise(r => setTimeout(r, 600));
+              const res = await sendCmd('Runtime.evaluate', { expression: EXTRACT_CREDIT_SCRIPT, returnByValue: true });
+              const val = res.result?.value;
+              if (val !== undefined && val !== null) {
+                liveCredits = val;
+                break;
+              }
+            }
+
+            if (liveCredits !== null) {
+              acc.available_credits = liveCredits;
+              acc.last_synced = new Date().toLocaleTimeString();
+              console.log(`[AccountPool] ✅ ${acc.email} -> Real Live Credits: ${liveCredits}`);
+            }
+          }
+
+          saveAccounts(accounts);
+          ws.close();
+          resolve();
+        } catch (e) {
+          try { ws.close(); } catch (err) {}
+          reject(e);
+        }
+      });
+
+      ws.on('error', (err) => reject(err));
+    });
+
+    isSyncingCredits = false;
+    console.log('[AccountPool] 🎉 All accounts real credits synced successfully!\n');
+    return { success: true, accounts: loadAccounts() };
+
+  } catch (e) {
+    isSyncingCredits = false;
+    console.error('[AccountPool] Error syncing accounts real credits:', e.message);
+    return { success: false, error: e.message };
+  }
+}
+
+// Auto-sync on startup & every 10 minutes
+setTimeout(syncAllAccountsRealCredits, 3000);
+setInterval(syncAllAccountsRealCredits, 10 * 60 * 1000);
+
 // ----------------- Core PhotoGPT Runner (Direct CDP Engine) -----------------
 async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
   const startTime = Date.now();
@@ -180,12 +254,12 @@ async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
   const account = getNextAvailableAccount();
   if (!account) {
     stats.failedGenerations++;
-    const err = new Error('账号池中无可用账号（所有账号积分已耗尽或未激活），请在控制面板中添加新账号！');
+    const err = new Error('所有账号积分均已不足 6 积分（或未激活），已自动停止轮询！请在控制面板添加新账号或充值。');
     addLog({ prompt, status: 'FAILED', error: err.message, account: 'None', duration: 0 });
     throw err;
   }
 
-  console.log(`\n[PhotoGPT Generator] ⚡ Using Account: ${account.email} (Credits: ${account.available_credits})`);
+  console.log(`\n[PhotoGPT Generator] ⚡ Selected Account: ${account.email} (Recorded Credits: ${account.available_credits})`);
   console.log(`[PhotoGPT Generator] 📝 Prompt: "${prompt.slice(0, 100)}..."`);
 
   const tab = await getPhotoGPTTab();
@@ -195,8 +269,6 @@ async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
     addLog({ prompt, status: 'FAILED', error: err.message, account: account.email, duration: 0 });
     throw err;
   }
-
-  console.log(`[PhotoGPT Generator] 🔗 Connecting to CDP WebSocket: ${tab.title}`);
 
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(tab.webSocketDebuggerUrl);
@@ -242,31 +314,47 @@ async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
       try {
         await sendCmd('Network.enable');
 
-        // Check if token changed -> reload page with new cookie
-        const needSwitch = account.nc_token && account.nc_token !== currentActiveToken;
-        if (needSwitch) {
-          console.log(`[PhotoGPT Generator] 🔄 Switching session to ${account.email}...`);
+        // Switch cookie & navigate to gpt-image-2
+        console.log(`[PhotoGPT Generator] 🔄 Switching session to ${account.email}...`);
+        await sendCmd('Network.setCookie', {
+          name: 'nc_token',
+          value: account.nc_token,
+          domain: '.photogpt.io',
+          path: '/'
+        });
+        if (account.anonymous_user_id) {
           await sendCmd('Network.setCookie', {
-            name: 'nc_token',
-            value: account.nc_token,
+            name: 'anonymous_user_id',
+            value: account.anonymous_user_id,
             domain: '.photogpt.io',
             path: '/'
           });
-          if (account.anonymous_user_id) {
-            await sendCmd('Network.setCookie', {
-              name: 'anonymous_user_id',
-              value: account.anonymous_user_id,
-              domain: '.photogpt.io',
-              path: '/'
-            });
+        }
+        currentActiveToken = account.nc_token;
+        await sendCmd('Page.navigate', { url: 'https://photogpt.io/ai-models/gpt-image-2' });
+
+        // Wait for page to mount and check real-time live credits
+        let liveCredits = null;
+        for (let i = 0; i < 10; i++) {
+          await new Promise(r => setTimeout(r, 500));
+          const credRes = await sendCmd('Runtime.evaluate', { expression: EXTRACT_CREDIT_SCRIPT, returnByValue: true });
+          const val = credRes.result?.value;
+          if (val !== undefined && val !== null) {
+            liveCredits = val;
+            break;
           }
-          currentActiveToken = account.nc_token;
-          await sendCmd('Page.navigate', { url: 'https://photogpt.io/ai-models/gpt-image-2' });
-          await new Promise(r => setTimeout(r, 2500));
-        } else if (!tab.url.includes('/ai-models/gpt-image-2')) {
-          console.log('[PhotoGPT Generator] Navigating to https://photogpt.io/ai-models/gpt-image-2...');
-          await sendCmd('Page.navigate', { url: 'https://photogpt.io/ai-models/gpt-image-2' });
-          await new Promise(r => setTimeout(r, 2000));
+        }
+
+        if (liveCredits !== null) {
+          console.log(`[PhotoGPT Generator] 📊 Real-time Live Balance from PhotoGPT: ${liveCredits} credits`);
+          updateAccountCredits(account.email, liveCredits);
+
+          // If real balance is insufficient (< 6), immediately auto-failover to next account!
+          if (liveCredits < 6) {
+            cleanup();
+            console.warn(`[PhotoGPT Generator] ⚠️ Account ${account.email} has only ${liveCredits} credits (< 6). Automatically stopping rotation for this account and switching to next...`);
+            return resolve(await doPhotoGPTGenerate({ prompt, refImage, aspectRatio }));
+          }
         }
 
         // Listen for prediction/handle API response
@@ -287,7 +375,7 @@ async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
                   predictionError = bodyData.message || 'Only 2 credits left';
                   updateAccountCredits(account.email, 2);
                 } else if (bodyData.code !== 100000 && bodyData.code !== undefined && bodyData.code !== 0) {
-                  predictionError = bodyData.message || 'API returned error code ' + bodyData.code;
+                  predictionError = bodyData.message || 'API error: ' + bodyData.code;
                 } else {
                   projectId = bodyData.data?.project_id || bodyData.data?.id;
                 }
@@ -302,7 +390,7 @@ async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
         const evalScript = `
           (() => {
             const ta = document.querySelector('textarea');
-            if (!ta) return { success: false, error: 'No textarea found on page' };
+            if (!ta) return { success: false, error: 'No textarea found' };
 
             ta.focus();
             const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
@@ -320,7 +408,7 @@ async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
               genBtn.click();
               return { success: true, text: genBtn.innerText, disabled: genBtn.disabled };
             }
-            return { success: false, error: 'No generate button found' };
+            return { success: false, error: 'No generate button' };
           })()
         `;
 
@@ -338,7 +426,7 @@ async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
 
         if (predictionError) {
           cleanup();
-          console.warn(`[PhotoGPT Generator] ⚠️ Account ${account.email} failed with: "${predictionError}". Trying next account...`);
+          console.warn(`[PhotoGPT Generator] ⚠️ Account ${account.email} failed: "${predictionError}". Trying next available account...`);
           return resolve(await doPhotoGPTGenerate({ prompt, refImage, aspectRatio }));
         }
 
@@ -382,9 +470,16 @@ async function doPhotoGPTGenerate({ prompt, refImage, aspectRatio = '16:9' }) {
         const fullResolutionUrl = resultImageUrl.split('?')[0];
         const durationSec = Math.round((Date.now() - startTime) / 1000);
 
-        if (account.available_credits !== undefined && account.available_credits >= 6) {
-          updateAccountCredits(account.email, account.available_credits - 6);
-        }
+        // Fetch updated balance after generation
+        try {
+          const postCredRes = await sendCmd('Runtime.evaluate', { expression: EXTRACT_CREDIT_SCRIPT, returnByValue: true });
+          const newLiveCredits = postCredRes.result?.value;
+          if (newLiveCredits !== undefined && newLiveCredits !== null) {
+            updateAccountCredits(account.email, newLiveCredits);
+          } else if (account.available_credits !== undefined && account.available_credits >= 6) {
+            updateAccountCredits(account.email, account.available_credits - 6);
+          }
+        } catch (e) {}
 
         stats.successfulGenerations++;
         addLog({
@@ -443,16 +538,16 @@ const DASHBOARD_HTML = `
         </div>
         <div>
           <h1 class="text-lg font-bold bg-gradient-to-r from-white via-gray-200 to-indigo-300 bg-clip-text text-transparent">PhotoGPT 反代服务控制台</h1>
-          <p class="text-xs text-gray-400">多账号自动轮询 · 无限生图 · 零审核拦截</p>
+          <p class="text-xs text-gray-400">实时积分同步 · 自动剔除欠费号 · 无限轮询生图</p>
         </div>
       </div>
       <div class="flex items-center space-x-3">
-        <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-2"></span> 服务运行中 (端口: 8180)
-        </span>
-        <button onclick="refreshData()" class="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm flex items-center space-x-1.5 transition">
-          <i class="fa-solid fa-rotate-right text-xs"></i> <span>刷新</span>
+        <button id="btn-sync-all" onclick="triggerSyncAllCredits()" class="px-3 py-1.5 rounded-lg bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-300 border border-indigo-500/30 text-xs flex items-center space-x-1.5 transition">
+          <i class="fa-solid fa-arrows-rotate"></i> <span>同步全部实时积分</span>
         </button>
+        <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-2"></span> 8180 端口运行中
+        </span>
       </div>
     </div>
   </header>
@@ -464,7 +559,7 @@ const DASHBOARD_HTML = `
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
       <div class="glass-card rounded-2xl p-4 flex items-center justify-between">
         <div>
-          <p class="text-xs text-gray-400 font-medium">账号总数 / 可用</p>
+          <p class="text-xs text-gray-400 font-medium">账号总数 / 可轮询</p>
           <h3 id="stat-accounts" class="text-2xl font-bold text-white mt-1">-- / --</h3>
         </div>
         <div class="w-12 h-12 rounded-xl bg-blue-500/10 text-blue-400 flex items-center justify-center text-xl">
@@ -557,7 +652,7 @@ const DASHBOARD_HTML = `
           <div id="play-result" class="hidden border-t border-gray-800 pt-4 space-y-3">
             <div class="flex items-center justify-between">
               <span class="text-xs font-medium text-emerald-400 flex items-center space-x-1.5">
-                <i class="fa-solid fa-circle-check"></i> <span id="res-duration">生成完成 (耗时 18s)</span>
+                <i class="fa-solid fa-circle-check"></i> <span id="res-duration">生成完成</span>
               </span>
               <a id="res-download-btn" href="#" download="photogpt_result.png" class="text-xs text-indigo-400 hover:text-indigo-300 flex items-center space-x-1">
                 <i class="fa-solid fa-download"></i> <span>下载原图</span>
@@ -585,7 +680,7 @@ const DASHBOARD_HTML = `
               <span class="text-indigo-300 font-mono text-[11px]">http://127.0.0.1:8180/v1</span>
             </div>
             <p class="text-[11px] text-gray-500 pt-1">
-              ✨ 提示：在【替换工作室】点击【生成人物三视图】即可直接触发本服务出图，全程自动轮询账号，零审核拦截。
+              ✨ 提示：系统会在轮询出图前全自动读取账号真实余额，积分 &lt; 6 的账号会自动跳过并标记停用，无需人工逐一核对。
             </p>
           </div>
         </div>
@@ -599,9 +694,11 @@ const DASHBOARD_HTML = `
               <i class="fa-solid fa-users-gear text-indigo-400"></i>
               <h2 class="font-semibold text-white">PhotoGPT 账号池管理</h2>
             </div>
-            <button onclick="openAddAccountModal()" class="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium flex items-center space-x-1.5 transition">
-              <i class="fa-solid fa-plus"></i> <span>添加账号</span>
-            </button>
+            <div class="flex items-center space-x-2">
+              <button onclick="openAddAccountModal()" class="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium flex items-center space-x-1.5 transition">
+                <i class="fa-solid fa-plus"></i> <span>添加账号</span>
+              </button>
+            </div>
           </div>
 
           <!-- Accounts Table -->
@@ -610,8 +707,8 @@ const DASHBOARD_HTML = `
               <thead class="text-gray-400 border-b border-gray-800">
                 <tr>
                   <th class="py-2.5 px-3">账号 / 邮箱</th>
-                  <th class="py-2.5 px-3">剩余积分</th>
-                  <th class="py-2.5 px-3">状态</th>
+                  <th class="py-2.5 px-3">实时积分</th>
+                  <th class="py-2.5 px-3">轮询状态</th>
                   <th class="py-2.5 px-3 text-right">操作</th>
                 </tr>
               </thead>
@@ -698,11 +795,31 @@ const DASHBOARD_HTML = `
       }
     }
 
+    async function triggerSyncAllCredits() {
+      const btn = document.getElementById('btn-sync-all');
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>正在全自动同步各账号实时积分...</span>';
+
+      try {
+        const res = await fetch('/api/accounts/sync-all', { method: 'POST' }).then(r => r.json());
+        if (res.success) {
+          refreshData();
+        } else {
+          alert('同步失败: ' + (res.message || res.error));
+        }
+      } catch (e) {
+        alert('同步失败: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i> <span>同步全部实时积分</span>';
+      }
+    }
+
     function renderStats(stats, accounts) {
-      const activeAccs = accounts.filter(a => a.active);
-      document.getElementById('stat-accounts').innerText = \`\${accounts.length} / \${activeAccs.length} 可用\`;
+      const eligibleAccs = accounts.filter(a => a.active && (a.available_credits === undefined || a.available_credits >= 6));
+      document.getElementById('stat-accounts').innerText = \`\${accounts.length} / \${eligibleAccs.length} 可用\`;
       
-      const totalCredits = accounts.reduce((sum, a) => sum + (a.available_credits || 0), 0);
+      const totalCredits = eligibleAccs.reduce((sum, a) => sum + (a.available_credits || 0), 0);
       const estImages = Math.floor(totalCredits / 6);
       document.getElementById('stat-credits').innerText = \`\${totalCredits} (约 \${estImages} 张)\`;
 
@@ -719,7 +836,8 @@ const DASHBOARD_HTML = `
       tbody.innerHTML = accounts.map(a => {
         const credits = a.available_credits !== undefined ? a.available_credits : 20;
         const progress = Math.min(100, Math.round((credits / 20) * 100));
-        const color = credits >= 6 ? 'bg-indigo-500' : 'bg-rose-500';
+        const isEligible = a.active && credits >= 6;
+        const color = isEligible ? 'bg-indigo-500' : 'bg-rose-500';
 
         return \`
           <tr class="hover:bg-gray-800/40 transition">
@@ -737,7 +855,7 @@ const DASHBOARD_HTML = `
             <td class="py-3 px-3">
               <div class="w-32 space-y-1">
                 <div class="flex items-center justify-between text-[11px]">
-                  <span class="font-semibold text-gray-200">\${credits} 积分</span>
+                  <span class="font-semibold \${credits >= 6 ? 'text-gray-200' : 'text-rose-400'}">\${credits} 积分</span>
                   <span class="text-gray-500">\${Math.floor(credits / 6)} 张</span>
                 </div>
                 <div class="w-full bg-gray-800 h-1.5 rounded-full overflow-hidden">
@@ -746,12 +864,12 @@ const DASHBOARD_HTML = `
               </div>
             </td>
             <td class="py-3 px-3">
-              \${a.active && credits >= 6 ? 
-                '<span class="px-2 py-0.5 rounded text-[10px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">正常轮询</span>' : 
-                '<span class="px-2 py-0.5 rounded text-[10px] font-medium bg-rose-500/10 text-rose-400 border border-rose-500/20">积分不足</span>'}
+              \${isEligible ? 
+                '<span class="px-2 py-0.5 rounded text-[10px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">🟢 正常轮询</span>' : 
+                '<span class="px-2 py-0.5 rounded text-[10px] font-medium bg-rose-500/10 text-rose-400 border border-rose-500/20">🔴 积分不足 (自动停止轮询)</span>'}
             </td>
             <td class="py-3 px-3 text-right space-x-2">
-              <button onclick="toggleAccount(\${a.id})" class="text-gray-400 hover:text-indigo-400 transition" title="切换状态">
+              <button onclick="toggleAccount(\${a.id})" class="text-gray-400 hover:text-indigo-400 transition" title="手动开关">
                 <i class="fa-solid \${a.active ? 'fa-toggle-on text-indigo-400 text-sm' : 'fa-toggle-off text-gray-600 text-sm'}"></i>
               </button>
               <button onclick="deleteAccount(\${a.id})" class="text-gray-400 hover:text-rose-400 transition" title="删除">
@@ -946,6 +1064,12 @@ app.get('/api/stats', (req, res) => {
 // GET /api/logs
 app.get('/api/logs', (req, res) => {
   res.json({ logs: generationLogs });
+});
+
+// POST /api/accounts/sync-all
+app.post('/api/accounts/sync-all', async (req, res) => {
+  const result = await syncAllAccountsRealCredits();
+  res.json(result);
 });
 
 // POST /api/v2/dreamina/image2image & text2image (Canvas Native Compatibility)
