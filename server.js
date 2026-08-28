@@ -1274,8 +1274,8 @@ app.post('/v1/images/generations', async (req, res) => {
   }
 });
 
-// GET /v1/models
-app.get('/v1/models', (req, res) => {
+// GET /v1/models & /models
+const handleModels = (req, res) => {
   res.json({
     object: 'list',
     data: [
@@ -1283,7 +1283,9 @@ app.get('/v1/models', (req, res) => {
       { id: 'gpt-image-2.0', object: 'model', created: 1787813800, owned_by: 'photogpt' }
     ]
   });
-});
+};
+app.get('/v1/models', handleModels);
+app.get('/models', handleModels);
 
 // GET /api/accounts - List all accounts & credits
 app.get('/api/accounts', (req, res) => {
